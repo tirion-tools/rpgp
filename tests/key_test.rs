@@ -1527,6 +1527,75 @@ fn test_short_ed25519() -> TestResult {
 }
 
 #[test]
+fn test_non_minimal_ed25519_secret_mpi() -> TestResult {
+    // Weird key: ed25519 legacy TSK, as exported by GnuPG, with a non-minimal secret MPI.
+    //
+    // GnuPG exports unprotected ed25519 legacy secret keys whose secret starts with a zero octet
+    // (about one in 256) with a secret MPI of bit count 256 over 32 octets, the first of them 0x00,
+    // and a checksum over those octets.
+    //
+    // Throwaway test key, made with GnuPG 2.4.8 in an empty GNUPGHOME by repeating
+    //   gpg --batch --pinentry-mode loopback --passphrase '' \
+    //     --quick-gen-key 'Test Nonminimal <test@example.invalid>' ed25519 sign never
+    // until the secret MPI of `gpg --export-secret-keys` was non-minimal, then
+    //   gpg --armor --export-secret-keys > ed25519-key-with-non-minimal-private-key-mpi.asc
+    //   printf test | gpg --detach-sign > ed25519-key-with-non-minimal-private-key-mpi.sig
+
+    let _ = pretty_env_logger::try_init();
+
+    let path = "./tests/weird/ed25519-key-with-non-minimal-private-key-mpi.asc";
+
+    let mut original = Vec::new();
+    armor::Dearmor::new(std::io::BufReader::new(File::open(path)?)).read_to_end(&mut original)?;
+    // S2K usage 0, then the secret MPI: 256 bits, leading zero octet
+    assert_eq!(&original[53..57], &[0x00, 0x01, 0x00, 0x00]);
+
+    let (pkey, _) = SignedSecretKey::from_armor_file(path)?;
+    assert_eq!(
+        pkey.primary_key.fingerprint().to_string(),
+        "3286a1b7083d1744d0ac6a76049988adaca7ddd3"
+    );
+    pkey.verify_bindings()?;
+
+    let SecretParams::Plain(PlainSecretParams::EdDSALegacy(
+        pgp::crypto::eddsa_legacy::SecretKey::Ed25519(secret),
+    )) = pkey.primary_key.secret_params()
+    else {
+        panic!("expected unencrypted ed25519 TSK");
+    };
+    assert_eq!(secret.as_bytes()[0], 0);
+
+    let sig = DetachedSignature::sign_binary_data(
+        rand::thread_rng(),
+        &pkey.primary_key,
+        &Password::empty(),
+        HashAlgorithm::Sha256,
+        DATA,
+    )?;
+    sig.verify(&pkey.public_key(), DATA)?;
+
+    // signature from GnuPG
+    let gpgsig = DetachedSignature::from_file(
+        "./tests/weird/ed25519-key-with-non-minimal-private-key-mpi.sig",
+    )?;
+    gpgsig.verify(&pkey.public_key(), DATA)?;
+
+    // serialized with a minimal secret MPI (248 bits or fewer) and a matching checksum
+    let serialized = pkey.to_bytes()?;
+    assert!(serialized.len() < original.len());
+    assert_eq!(serialized[53], 0);
+    assert!(u16::from_be_bytes([serialized[54], serialized[55]]) <= 248);
+    let reparsed = SignedSecretKey::from_bytes(&*serialized)?;
+    assert_eq!(
+        reparsed.primary_key.secret_params(),
+        pkey.primary_key.secret_params()
+    );
+    assert_eq!(reparsed.to_bytes()?, serialized);
+
+    Ok(())
+}
+
+#[test]
 fn test_non_standard_rsa_modulus() -> TestResult {
     // Weird key: RSA with modulus 257
 

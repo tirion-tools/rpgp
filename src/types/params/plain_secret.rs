@@ -1,9 +1,5 @@
-use std::{
-    hash::Hasher,
-    io::{self, BufRead},
-};
+use std::io::{self, BufRead};
 
-use byteorder::{BigEndian, ByteOrder};
 use bytes::{BufMut, Bytes, BytesMut};
 use hkdf::Hkdf;
 use log::debug;
@@ -280,17 +276,32 @@ impl PlainSecretParams {
         alg: PublicKeyAlgorithm,
         public_params: &PublicParams,
     ) -> Result<Self> {
-        let params = Self::try_from_reader_inner(&mut i, alg, public_params)?;
         if version == KeyVersion::V3 || version == KeyVersion::V4 {
-            let checksum = i.read_arr::<2>()?;
-            params.compare_checksum_simple(&checksum)?;
-            ensure!(
-                !i.has_remaining()?,
-                "failed to process full secret key material"
+            // The two-octet checksum is the sum of the algorithm-specific octets as they are
+            // encoded, so verify it over exactly those octets, before parsing them.
+            //
+            // Comparing it against our own (normalized) re-encoding instead would reject
+            // material that is read fine otherwise, such as MPIs with leading zero octets:
+            // GnuPG writes about one in 256 unprotected EdDSA legacy secret keys with a
+            // non-minimal secret MPI (a bit count of 256 over a leading zero octet), and a
+            // checksum over those octets.
+            //
+            // See <https://www.rfc-editor.org/rfc/rfc9580.html#section-5.5.3-3.6.1>
+            let mut data = Zeroizing::new(Vec::new());
+            i.read_to_end(&mut data)?;
+            let Some((material, checksum)) = data.split_last_chunk::<2>() else {
+                bail!("secret key material is missing its checksum");
+            };
+            ensure_eq!(
+                u16::from_be_bytes(*checksum),
+                checksum::calculate_simple(material),
+                "Invalid checksum"
             );
+
+            return Self::try_from_reader_no_checksum(material, version, alg, public_params);
         }
 
-        Ok(params)
+        Self::try_from_reader_inner(i, alg, public_params)
     }
 
     pub fn string_to_key_id(&self) -> u8 {
@@ -700,17 +711,6 @@ impl PlainSecretParams {
         sum
     }
 
-    fn compare_checksum_simple(&self, other: &[u8]) -> Result<()> {
-        let mut hasher = checksum::SimpleChecksum::default();
-        self.to_writer_raw(&mut hasher)?;
-        ensure_eq!(
-            BigEndian::read_u16(other),
-            hasher.finish() as u16,
-            "Invalid checksum"
-        );
-        Ok(())
-    }
-
     fn to_writer_raw<W: io::Write>(&self, writer: &mut W) -> Result<()> {
         match self {
             PlainSecretParams::RSA(key) => {
@@ -1005,6 +1005,84 @@ mod tests {
             let public_params = PublicParams::try_from(&secret_params)?;
             let new_params = PlainSecretParams::try_from_reader(&mut &buf[..], KeyVersion::V6, alg, &public_params)?;
             prop_assert_eq!(secret_params, new_params);
+        }
+    }
+
+    /// Secret key material of an EdDSA legacy key whose secret has a leading zero octet, and its
+    /// minimal and GnuPG-style non-minimal (bit count 256 over 32 octets) v4 encodings.
+    fn eddsa_legacy_leading_zero() -> (PlainSecretParams, PublicParams, Vec<u8>, Vec<u8>) {
+        let mut raw = [0x42u8; 32];
+        raw[0] = 0;
+        let key = ed25519::SecretKey::try_from_bytes(raw, ed25519::Mode::EdDSALegacy).unwrap();
+        let params = PlainSecretParams::EdDSALegacy(eddsa_legacy::SecretKey::Ed25519(key));
+        let public_params = PublicParams::try_from(&params).unwrap();
+
+        let mut minimal = Vec::new();
+        params.to_writer(&mut minimal, KeyVersion::V4).unwrap();
+        // 247 bits over 31 octets, then the checksum
+        assert_eq!(minimal.len(), 2 + 31 + 2);
+        assert_eq!(&minimal[..2], &[0x00, 0xf7]);
+
+        let mut non_minimal = vec![0x01, 0x00, 0x00];
+        non_minimal.extend_from_slice(&raw[1..]);
+        non_minimal.extend_from_slice(&checksum::calculate_simple(&non_minimal).to_be_bytes());
+
+        (params, public_params, minimal, non_minimal)
+    }
+
+    #[test]
+    fn non_minimal_mpi_checksum_over_encoded_octets_v4() {
+        let (params, public_params, minimal, non_minimal) = eddsa_legacy_leading_zero();
+
+        let parsed = PlainSecretParams::try_from_reader(
+            &non_minimal[..],
+            KeyVersion::V4,
+            PublicKeyAlgorithm::EdDSALegacy,
+            &public_params,
+        )
+        .expect("non-minimal MPI with a checksum over its octets");
+        assert_eq!(parsed, params);
+
+        // re-serialized in minimal form, with a matching checksum
+        let mut buf = Vec::new();
+        parsed.to_writer(&mut buf, KeyVersion::V4).unwrap();
+        assert_eq!(buf, minimal);
+    }
+
+    #[test]
+    fn non_minimal_mpi_checksum_over_other_octets_v4() {
+        let (_, public_params, minimal, mut non_minimal) = eddsa_legacy_leading_zero();
+
+        // The checksum of the minimal encoding does not cover the non-minimal octets.
+        let len = non_minimal.len();
+        non_minimal[len - 2..].copy_from_slice(&minimal[minimal.len() - 2..]);
+        assert_ne!(
+            checksum::calculate_simple(&non_minimal[..len - 2]).to_be_bytes(),
+            non_minimal[len - 2..]
+        );
+
+        let err = PlainSecretParams::try_from_reader(
+            &non_minimal[..],
+            KeyVersion::V4,
+            PublicKeyAlgorithm::EdDSALegacy,
+            &public_params,
+        )
+        .expect_err("checksum mismatch");
+        assert!(err.to_string().contains("Invalid checksum"), "{err}");
+    }
+
+    #[test]
+    fn secret_key_material_without_checksum_v4() {
+        let (_, public_params, minimal, _) = eddsa_legacy_leading_zero();
+
+        for len in [0, 1, minimal.len() - 2] {
+            assert!(PlainSecretParams::try_from_reader(
+                &minimal[..len],
+                KeyVersion::V4,
+                PublicKeyAlgorithm::EdDSALegacy,
+                &public_params,
+            )
+            .is_err());
         }
     }
 }
